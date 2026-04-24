@@ -377,13 +377,15 @@ def main():
             cv2.imwrite(png_path, frame_bgr)
 
             if gt_pred is not None:
-                psnr_hw = -10 * np.log10(
-                    max(np.mean((hw_pred.astype(np.float64) -
-                                 gt_pred.astype(np.float64))**2), 1e-12))
-                psnr_fp = -10 * np.log10(
-                    max(np.mean((fp32_pred.astype(np.float64) -
-                                 gt_pred.astype(np.float64))**2), 1e-12))
-                print(f'  pred[{pred_idx}] PSNR: hw={psnr_hw:.2f} dB  fp32={psnr_fp:.2f} dB')
+                def psnr(a, b):
+                    # ensure same shape and uint8 before comparing
+                    if a.shape != b.shape:
+                        b = np.array(Image.fromarray(b).resize(
+                            (a.shape[1], a.shape[0]), Image.BILINEAR))
+                    mse = np.mean((a.astype(np.float64) - b.astype(np.float64))**2)
+                    return -10 * np.log10(max(mse / (255.**2), 1e-12))
+                print(f'  pred[{pred_idx}] PSNR: hw={psnr(hw_pred, gt_pred):.2f} dB'
+                      f'  fp32={psnr(fp32_pred, gt_pred):.2f} dB')
 
         print(f'  Folder done.')
 
