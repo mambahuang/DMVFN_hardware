@@ -271,10 +271,11 @@ def run_gen_stim():
 # ---------------------------------------------------------------------------
 # Build one video frame: GT_left | hw_pred | GT_right
 # ---------------------------------------------------------------------------
-def make_frame(gt_left, hw_pred, gt_right):
-    """All inputs are HWC uint8 RGB. Returns HWC uint8 BGR for cv2."""
+def make_frame(src0, src1, hw_pred):
+    """All inputs are HWC uint8 RGB. Returns HWC uint8 BGR for cv2.
+    Layout: src0 | src1 | hw_pred"""
     gap = np.full((SRC_H, 4, 3), 40, dtype=np.uint8)
-    row = np.concatenate([gt_left, gap, hw_pred, gap, gt_right], axis=1)
+    row = np.concatenate([src0, gap, src1, gap, hw_pred], axis=1)
     return cv2.cvtColor(row, cv2.COLOR_RGB2BGR)
 
 # ---------------------------------------------------------------------------
@@ -304,6 +305,9 @@ def main():
     frames_dir = os.path.join(args.out_dir, f'{DATASET}_frames')
     os.makedirs(frames_dir, exist_ok=True)
 
+    psnr_log_path = os.path.join(args.out_dir, f'{DATASET}_psnr.txt')
+    psnr_records = []  # list of (folder_name, pred_idx, psnr_hw, psnr_fp32)
+
     t_total = time.time()
 
     for folder_idx, folder in enumerate(folders):
@@ -327,10 +331,11 @@ def main():
         ]
 
         # Write frame[0] and frame[1] directly (no prediction)
+        # Layout: frame[fi] | frame[fi+1] | frame[fi] (placeholder for pred)
         for fi in range(2):
-            gt = gt_frames[fi]
-            # side-by-side: for pure GT frames show frame | frame | frame
-            frame_bgr = make_frame(gt, gt, gt)
+            f0 = gt_frames[fi]
+            f1 = gt_frames[fi + 1] if (fi + 1) < len(gt_frames) else f0
+            frame_bgr = make_frame(f0, f1, f0)
             video.write(frame_bgr)
             png_path = os.path.join(frames_dir,
                 f'folder{folder_idx:03d}_f{fi:02d}_gt.png')
@@ -365,10 +370,13 @@ def main():
             if hw_pred is None:
                 print(f'  WARNING: sim returned None for pred[{pred_idx}], using fp32')
                 hw_pred = fp32_pred
+            else:
+                # sim_dmvfn stores channels in BGR order due to dump convention;
+                # swap R/B back to RGB before display
+                hw_pred = hw_pred[:, :, ::-1].copy()
 
-            # Step 4: compose frame
-            # Layout: GT_left(frame[i]) | hw_pred | GT_right(frame[i+1])
-            frame_bgr = make_frame(img0_uint8, hw_pred, img1_uint8)
+            # Step 4: compose frame — layout: src0 | src1 | hw_pred
+            frame_bgr = make_frame(img0_uint8, img1_uint8, hw_pred)
             video.write(frame_bgr)
 
             # Save individual PNGs
@@ -378,23 +386,35 @@ def main():
 
             if gt_pred is not None:
                 def psnr(a, b):
-                    # ensure same shape and uint8 before comparing
                     if a.shape != b.shape:
                         b = np.array(Image.fromarray(b).resize(
                             (a.shape[1], a.shape[0]), Image.BILINEAR))
                     mse = np.mean((a.astype(np.float64) - b.astype(np.float64))**2)
                     return -10 * np.log10(max(mse / (255.**2), 1e-12))
-                print(f'  pred[{pred_idx}] PSNR: hw={psnr(hw_pred, gt_pred):.2f} dB'
-                      f'  fp32={psnr(fp32_pred, gt_pred):.2f} dB')
+                p_hw  = psnr(hw_pred, gt_pred)
+                p_fp  = psnr(fp32_pred, gt_pred)
+                print(f'  pred[{pred_idx}] PSNR: hw={p_hw:.2f} dB  fp32={p_fp:.2f} dB')
+                psnr_records.append((os.path.basename(folder), pred_idx, p_hw, p_fp))
 
         print(f'  Folder done.')
 
     video.release()
 
+    # Write PSNR log
+    with open(psnr_log_path, 'w') as f:
+        f.write(f'folder\tpred_idx\tpsnr_hw(dB)\tpsnr_fp32(dB)\n')
+        for folder_name, pred_idx, p_hw, p_fp in psnr_records:
+            f.write(f'{folder_name}\t{pred_idx}\t{p_hw:.4f}\t{p_fp:.4f}\n')
+        if psnr_records:
+            avg_hw  = sum(r[2] for r in psnr_records) / len(psnr_records)
+            avg_fp  = sum(r[3] for r in psnr_records) / len(psnr_records)
+            f.write(f'\nAVERAGE\t-\t{avg_hw:.4f}\t{avg_fp:.4f}\n')
+
     print(f'\n{"="*60}')
     print(f' Done in {time.time()-t_total:.1f}s')
     print(f' Video ({args.fps} fps): {video_path}')
     print(f' Frames: {frames_dir}/')
+    print(f' PSNR log: {psnr_log_path}')
     print(f'{"="*60}')
 
 
