@@ -1,15 +1,17 @@
 #!/usr/bin/env python3
 """
-analyze_psnr_heatmap.py — HW PSNR analysis with heatmaps
-=========================================================
+analyze_psnr_heatmap.py — HW PSNR / SSIM / LPIPS analysis with heatmaps
+=========================================================================
 Two modes:
   A) PSNR log analysis  (always runs — only needs *_psnr.txt)
      - Bar charts, gap analysis (fp32 - hw), folder/pred_idx breakdown
-  B) Frame-level spatial heatmap
+  B) Frame-level spatial heatmap + perceptual metrics (SSIM, LPIPS)
      - With --gt_root: compares hw_pred (cropped from composite PNG) vs true GT
        GT layout: data/{dataset}/test/{folder_id}/im1.png im2.png ... (sorted)
        pred_idx k  →  gt_frames[k]  (same logic as make_video.py)
      - Without --gt_root: compares hw_pred vs src0 from the composite (fallback)
+     - SSIM  : requires scikit-image  (pip install scikit-image)
+     - LPIPS : requires lpips + torch (pip install lpips torch); auto-skipped if absent
 
 Usage (from repo root):
   # With GT dataset (recommended, run remotely):
@@ -34,6 +36,26 @@ matplotlib.use('Agg')
 import matplotlib.pyplot as plt
 import matplotlib.gridspec as gridspec
 from PIL import Image
+
+# --- optional metric backends ---
+try:
+    from skimage.metrics import structural_similarity as _ssim_fn
+    HAS_SKIMAGE = True
+except ImportError:
+    HAS_SKIMAGE = False
+    print('[WARN] scikit-image not found — SSIM will be skipped. '
+          '(pip install scikit-image)')
+
+try:
+    import torch
+    import lpips as _lpips_lib
+    _lpips_net = _lpips_lib.LPIPS(net='alex', verbose=False)
+    _lpips_net.eval()
+    HAS_LPIPS = True
+except Exception:
+    HAS_LPIPS = False
+    print('[WARN] lpips/torch not found — LPIPS will be skipped. '
+          '(pip install lpips torch)')
 
 ROOT     = os.path.abspath(os.path.join(os.path.dirname(__file__), '..'))
 VID_ROOT = os.path.join(ROOT, 'video_output', 'video_output')
@@ -61,6 +83,25 @@ def load_rgb(path):
 def psnr_val(a, b):
     mse = np.mean((a - b) ** 2)
     return float('inf') if mse == 0 else 10 * np.log10(255.**2 / mse)
+
+def ssim_val(a, b):
+    """SSIM in [0,1].  a, b: float32 H×W×3, range [0,255]."""
+    if not HAS_SKIMAGE:
+        return None
+    a8 = a.astype(np.uint8)
+    b8 = b.astype(np.uint8)
+    return float(_ssim_fn(a8, b8, channel_axis=2, data_range=255))
+
+def lpips_val(a, b):
+    """LPIPS (AlexNet). a, b: float32 H×W×3, range [0,255]. Returns scalar."""
+    if not HAS_LPIPS:
+        return None
+    import torch
+    def to_tensor(x):
+        t = torch.from_numpy(x / 127.5 - 1.0).permute(2, 0, 1).unsqueeze(0).float()
+        return t
+    with torch.no_grad():
+        return float(_lpips_net(to_tensor(a), to_tensor(b)).item())
 
 # ---------------------------------------------------------------------------
 # Part A: PSNR log analysis
@@ -306,13 +347,17 @@ def spatial_analysis(dataset, out_dir, n_folders, gt_root=None):
         ch_accum  += ch_e
         count += 1
 
-        p = psnr_val(hw, ref)
+        parsed_name = _parse_frame_filename(basename)
         sample_records.append({
-            'label': basename,
-            'psnr':  p,
-            'hw':    hw.astype(np.uint8),
-            'ref':   ref.astype(np.uint8),
-            'err':   err,
+            'label':      basename,
+            'folder_idx': parsed_name[0] if parsed_name else -1,
+            'pred_idx':   parsed_name[1] if parsed_name else -1,
+            'psnr':       psnr_val(hw, ref),
+            'ssim':       ssim_val(hw, ref),
+            'lpips':      lpips_val(hw, ref),
+            'hw':         hw.astype(np.uint8),
+            'ref':        ref.astype(np.uint8),
+            'err':        err,
         })
 
     if skipped_gt:
@@ -394,12 +439,209 @@ def spatial_analysis(dataset, out_dir, n_folders, gt_root=None):
                         vmin=0, vmax=max(rec['err'].max(), 1))
         plt.colorbar(im, ax=ax3, fraction=0.046, pad=0.04, label='|err|')
         ax3.set_title('Error heatmap'); ax3.axis('off')
+        ssim_str  = f'  SSIM={rec["ssim"]:.4f}'  if rec['ssim']  is not None else ''
+        lpips_str = f'  LPIPS={rec["lpips"]:.4f}' if rec['lpips'] is not None else ''
         fig.suptitle(f'{dataset.upper()} [{tag}]  {rec["label"]}  '
-                     f'PSNR(hw/{ref_label})={rec["psnr"]:.2f} dB', fontsize=10)
+                     f'PSNR={rec["psnr"]:.2f} dB{ssim_str}{lpips_str}', fontsize=9)
         fig.tight_layout()
         p = os.path.join(out_dir, f'{dataset}_spatial_detail_{tag}.png')
         fig.savefig(p, dpi=150); plt.close(fig)
         print(f'  Saved: {p}')
+
+    # --- Perceptual metrics charts ---
+    plot_perceptual_metrics(dataset, sample_records, out_dir, ref_label)
+
+
+# ---------------------------------------------------------------------------
+# Part C: SSIM / LPIPS bar charts, heatmaps, trend lines
+# ---------------------------------------------------------------------------
+def plot_perceptual_metrics(dataset, records, out_dir, ref_label):
+    """Generate SSIM and LPIPS charts from per-frame sample_records."""
+    has_ssim  = any(r['ssim']  is not None for r in records)
+    has_lpips = any(r['lpips'] is not None for r in records)
+    if not has_ssim and not has_lpips:
+        print('  [SKIP C] neither SSIM nor LPIPS available')
+        return
+
+    # collect unique folder/pred_idx values
+    folder_idxs = sorted(set(r['folder_idx'] for r in records if r['folder_idx'] >= 0))
+    pred_idxs   = sorted(set(r['pred_idx']   for r in records if r['pred_idx']   >= 0))
+
+    # ---- helpers ----
+    def _bar_chart(vals, labels, title, ylabel, fname, color, higher_is_better=True):
+        x = np.arange(len(vals))
+        fig, ax = plt.subplots(figsize=(max(12, len(vals) * 0.55), 4))
+        ax.bar(x, vals, color=color, alpha=0.8)
+        avg = np.mean(vals)
+        ax.axhline(avg, color='k', linestyle='--', linewidth=1,
+                   label=f'avg={avg:.4f}')
+        ax.set_xticks(x)
+        ax.set_xticklabels(labels, rotation=60, ha='right', fontsize=7)
+        ax.set_ylabel(ylabel)
+        direction = '↑ better' if higher_is_better else '↓ better'
+        ax.set_title(f'{dataset.upper()} — {title}  ({direction})')
+        ax.legend(fontsize=8)
+        fig.tight_layout()
+        fig.savefig(fname, dpi=150); plt.close(fig)
+        print(f'  Saved: {fname}')
+
+    def _matrix_heatmap(metric_key, title, fname, cmap, higher_is_better=True):
+        mat = np.full((len(folder_idxs), len(pred_idxs)), np.nan)
+        fi_map = {f: i for i, f in enumerate(folder_idxs)}
+        pi_map = {p: i for i, p in enumerate(pred_idxs)}
+        for r in records:
+            v = r[metric_key]
+            if v is not None and r['folder_idx'] >= 0 and r['pred_idx'] >= 0:
+                mat[fi_map[r['folder_idx']], pi_map[r['pred_idx']]] = v
+        if np.all(np.isnan(mat)):
+            return
+        fig, ax = plt.subplots(figsize=(max(5, len(pred_idxs) * 1.2),
+                                        max(4, len(folder_idxs) * 0.55)))
+        im = ax.imshow(mat, cmap=cmap, aspect='auto',
+                       vmin=np.nanmin(mat), vmax=np.nanmax(mat))
+        direction = '↑ better' if higher_is_better else '↓ better'
+        plt.colorbar(im, ax=ax, label=f'{metric_key.upper()}  ({direction})')
+        ax.set_xticks(range(len(pred_idxs)))
+        ax.set_xticklabels([f'pred {p}' for p in pred_idxs])
+        ax.set_yticks(range(len(folder_idxs)))
+        ax.set_yticklabels([f'folder{i:03d}' for i in folder_idxs], fontsize=8)
+        for fi in range(len(folder_idxs)):
+            for pi in range(len(pred_idxs)):
+                v = mat[fi, pi]
+                if not np.isnan(v):
+                    ax.text(pi, fi, f'{v:.3f}', ha='center', va='center',
+                            fontsize=7, color='black')
+        ax.set_title(f'{dataset.upper()} — {title} per folder × pred_idx')
+        fig.tight_layout()
+        fig.savefig(fname, dpi=150); plt.close(fig)
+        print(f'  Saved: {fname}')
+
+    def _trend_line(metric_key, title, fname, color, higher_is_better=True):
+        by_pidx = {p: [] for p in pred_idxs}
+        for r in records:
+            v = r[metric_key]
+            if v is not None and r['pred_idx'] in by_pidx:
+                by_pidx[r['pred_idx']].append(v)
+        means = [np.mean(by_pidx[p]) if by_pidx[p] else np.nan for p in pred_idxs]
+        fig, ax = plt.subplots(figsize=(6, 3.5))
+        ax.plot(pred_idxs, means, 'o-', color=color)
+        ax.set_xlabel('Predicted frame index')
+        ax.set_ylabel(metric_key.upper())
+        direction = '↑ better' if higher_is_better else '↓ better'
+        ax.set_title(f'{dataset.upper()} — {title} vs prediction distance  ({direction})')
+        ax.grid(True, alpha=0.3)
+        fig.tight_layout()
+        fig.savefig(fname, dpi=150); plt.close(fig)
+        print(f'  Saved: {fname}')
+
+    labels = [f"f{r['folder_idx']:03d}_p{r['pred_idx']}" for r in records]
+
+    # === SSIM ===
+    if has_ssim:
+        ssim_vals = [r['ssim'] for r in records if r['ssim'] is not None]
+        ssim_labs = [labels[i] for i, r in enumerate(records) if r['ssim'] is not None]
+
+        _bar_chart(ssim_vals, ssim_labs,
+                   title=f'SSIM (HW vs {ref_label})',
+                   ylabel='SSIM',
+                   fname=os.path.join(out_dir, f'{dataset}_ssim_bar.png'),
+                   color='#74c476', higher_is_better=True)
+
+        _matrix_heatmap('ssim',
+                        title=f'SSIM (HW vs {ref_label})',
+                        fname=os.path.join(out_dir, f'{dataset}_ssim_heatmap.png'),
+                        cmap='RdYlGn', higher_is_better=True)
+
+        _trend_line('ssim',
+                    title=f'SSIM (HW vs {ref_label})',
+                    fname=os.path.join(out_dir, f'{dataset}_ssim_trend.png'),
+                    color='#31a354', higher_is_better=True)
+
+        # per-folder mean SSIM bar
+        by_folder = {}
+        for r in records:
+            if r['ssim'] is not None and r['folder_idx'] >= 0:
+                by_folder.setdefault(r['folder_idx'], []).append(r['ssim'])
+        if by_folder:
+            fkeys  = sorted(by_folder)
+            fmeans = [np.mean(by_folder[k]) for k in fkeys]
+            _bar_chart(fmeans, [f'folder{k:03d}' for k in fkeys],
+                       title=f'Mean SSIM per folder (HW vs {ref_label})',
+                       ylabel='Mean SSIM',
+                       fname=os.path.join(out_dir, f'{dataset}_ssim_per_folder.png'),
+                       color='#74c476', higher_is_better=True)
+
+    # === LPIPS ===
+    if has_lpips:
+        lpips_vals = [r['lpips'] for r in records if r['lpips'] is not None]
+        lpips_labs = [labels[i] for i, r in enumerate(records) if r['lpips'] is not None]
+
+        _bar_chart(lpips_vals, lpips_labs,
+                   title=f'LPIPS (HW vs {ref_label})',
+                   ylabel='LPIPS',
+                   fname=os.path.join(out_dir, f'{dataset}_lpips_bar.png'),
+                   color='#fc8d59', higher_is_better=False)
+
+        _matrix_heatmap('lpips',
+                        title=f'LPIPS (HW vs {ref_label})',
+                        fname=os.path.join(out_dir, f'{dataset}_lpips_heatmap.png'),
+                        cmap='RdYlGn_r', higher_is_better=False)
+
+        _trend_line('lpips',
+                    title=f'LPIPS (HW vs {ref_label})',
+                    fname=os.path.join(out_dir, f'{dataset}_lpips_trend.png'),
+                    color='#e6550d', higher_is_better=False)
+
+        # per-folder mean LPIPS bar
+        by_folder = {}
+        for r in records:
+            if r['lpips'] is not None and r['folder_idx'] >= 0:
+                by_folder.setdefault(r['folder_idx'], []).append(r['lpips'])
+        if by_folder:
+            fkeys  = sorted(by_folder)
+            fmeans = [np.mean(by_folder[k]) for k in fkeys]
+            _bar_chart(fmeans, [f'folder{k:03d}' for k in fkeys],
+                       title=f'Mean LPIPS per folder (HW vs {ref_label})',
+                       ylabel='Mean LPIPS',
+                       fname=os.path.join(out_dir, f'{dataset}_lpips_per_folder.png'),
+                       color='#fc8d59', higher_is_better=False)
+
+    # === Combined summary: PSNR / SSIM / LPIPS side-by-side ===
+    metrics_avail = []
+    if True:
+        metrics_avail.append(('PSNR (dB)', [r['psnr'] for r in records], '#4292c6', True))
+    if has_ssim:
+        metrics_avail.append(('SSIM', [r['ssim'] if r['ssim'] is not None else np.nan
+                                        for r in records], '#74c476', True))
+    if has_lpips:
+        metrics_avail.append(('LPIPS', [r['lpips'] if r['lpips'] is not None else np.nan
+                                         for r in records], '#fc8d59', False))
+
+    n = len(metrics_avail)
+    fig, axes = plt.subplots(1, n, figsize=(6 * n, 3.5))
+    if n == 1:
+        axes = [axes]
+    for ax, (name, vals, color, hib) in zip(axes, metrics_avail):
+        clean = [v for v in vals if not (v is None or np.isnan(v))]
+        if not clean:
+            continue
+        avg = np.mean(clean)
+        direction = '↑' if hib else '↓'
+        ax.bar(range(len(vals)), vals, color=color, alpha=0.75)
+        ax.axhline(avg, color='k', linestyle='--', linewidth=1,
+                   label=f'avg={avg:.4f}')
+        ax.set_title(f'{name}  ({direction} better)')
+        ax.set_ylabel(name)
+        ax.legend(fontsize=8)
+        ax.set_xticks([])
+        ax.grid(True, alpha=0.2, axis='y')
+    fig.suptitle(f'{dataset.upper()} — HW vs {ref_label}  ({len(records)} frames)',
+                 fontsize=11)
+    fig.tight_layout()
+    p = os.path.join(out_dir, f'{dataset}_metrics_summary.png')
+    fig.savefig(p, dpi=150); plt.close(fig)
+    print(f'  Saved: {p}')
+
 
 # ---------------------------------------------------------------------------
 def analyze(dataset):
